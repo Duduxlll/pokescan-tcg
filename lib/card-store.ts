@@ -1,4 +1,4 @@
-import { Redis } from '@upstash/redis'
+import { createClient } from '@libsql/client'
 
 export interface CardData {
   id: string
@@ -15,44 +15,65 @@ export interface CardData {
   scannedAt: number
 }
 
-const CARD_KEY = 'pokescan:current-card'
+const isTursoConfigured =
+  process.env.TURSO_DATABASE_URL && process.env.TURSO_AUTH_TOKEN
 
-// Usa Redis se as env vars estiverem configuradas, senão cai para in-memory (dev local)
-const isRedisConfigured =
-  process.env.UPSTASH_REDIS_REST_URL &&
-  process.env.UPSTASH_REDIS_REST_TOKEN
-
-const redis = isRedisConfigured
-  ? new Redis({
-      url:   process.env.UPSTASH_REDIS_REST_URL!,
-      token: process.env.UPSTASH_REDIS_REST_TOKEN!,
-    })
-  : null
-
-// Fallback em memória para desenvolvimento local
+// Fallback em memória para desenvolvimento local (sem Turso configurado)
 let localCard: CardData | null = null
+
+function getClient() {
+  if (!isTursoConfigured) return null
+  return createClient({
+    url:       process.env.TURSO_DATABASE_URL!,
+    authToken: process.env.TURSO_AUTH_TOKEN!,
+  })
+}
+
+async function ensureTable(db: ReturnType<typeof createClient>) {
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS current_card (
+      id      TEXT PRIMARY KEY DEFAULT 'singleton',
+      data    TEXT,
+      updated INTEGER
+    )
+  `)
+}
 
 export async function setCurrentCard(card: CardData): Promise<void> {
   const data = { ...card, scannedAt: Date.now() }
-  if (redis) {
-    await redis.set(CARD_KEY, JSON.stringify(data), { ex: 3600 }) // expira em 1h
+  const db = getClient()
+  if (db) {
+    await ensureTable(db)
+    await db.execute({
+      sql: `INSERT INTO current_card (id, data, updated)
+            VALUES ('singleton', ?, ?)
+            ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated = excluded.updated`,
+      args: [JSON.stringify(data), data.scannedAt],
+    })
   } else {
     localCard = data
   }
 }
 
 export async function getCurrentCard(): Promise<CardData | null> {
-  if (redis) {
-    const raw = await redis.get<string>(CARD_KEY)
-    if (!raw) return null
-    return typeof raw === 'string' ? JSON.parse(raw) : (raw as CardData)
+  const db = getClient()
+  if (db) {
+    await ensureTable(db)
+    const result = await db.execute(
+      `SELECT data FROM current_card WHERE id = 'singleton' LIMIT 1`
+    )
+    const row = result.rows[0]
+    if (!row?.data) return null
+    return JSON.parse(row.data as string) as CardData
   }
   return localCard
 }
 
 export async function clearCurrentCard(): Promise<void> {
-  if (redis) {
-    await redis.del(CARD_KEY)
+  const db = getClient()
+  if (db) {
+    await ensureTable(db)
+    await db.execute(`DELETE FROM current_card WHERE id = 'singleton'`)
   } else {
     localCard = null
   }
