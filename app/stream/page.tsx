@@ -114,10 +114,16 @@ export default function StreamPage() {
   const videoRef  = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
-  const autoRef   = useRef<ReturnType<typeof setInterval> | null>(null)
-  const lastIdRef = useRef<string | null>(null)
-  const coolRef   = useRef(false)
+  const autoRef      = useRef<ReturnType<typeof setInterval> | null>(null)
+  const lastIdRef    = useRef<string | null>(null)
+  const coolRef      = useRef(false)
   const analyzingRef = useRef(false)
+  const abortRef     = useRef<AbortController | null>(null)
+  const cameraBoxRef = useRef<HTMLDivElement>(null)
+  const dragInfoRef  = useRef<{
+    type: string; px: number; py: number
+    sx: number; sy: number; sw: number; sh: number
+  } | null>(null)
 
   // Refs dos botões para os dropdowns com posição fixed
   const camBtnRef  = useRef<HTMLButtonElement>(null)
@@ -148,6 +154,10 @@ export default function StreamPage() {
   const [shownSuggCount, setShownSuggCount] = useState(5)
   const [flash, setFlash]           = useState(false)
   const [brlRate, setBrlRate]       = useState(5.7)
+
+  // ── Região de scan ajustável (percentuais 0–100 do frame) ──
+  const [scanRegion, setScanRegion] = useState({ x: 8, y: 8, w: 84, h: 84 })
+  const [adjustMode, setAdjustMode] = useState(false)
 
   // ── Taxa de câmbio USD→BRL ──
   useEffect(() => {
@@ -251,11 +261,20 @@ export default function StreamPage() {
     }
   }, [cameraActive, stopCamera])
 
+  // ── Cancelar scan travado ──
+  const cancelAnalyze = useCallback(() => {
+    abortRef.current?.abort()
+    abortRef.current = null
+    analyzingRef.current = false
+    setAnalyzing(false)
+    setStatusKind('idle')
+    setStatusMsg('Scan cancelado — pronto para tentar novamente')
+  }, [])
+
   // ── Capturar e analisar ──
   const captureAndAnalyze = useCallback(async (forceManual = false) => {
     if (!videoRef.current || !canvasRef.current) return
     if (analyzingRef.current) return
-    // Manual sempre ignora cooldown; auto-scan respeita
     if (!forceManual && coolRef.current) return
 
     const video = videoRef.current
@@ -267,7 +286,6 @@ export default function StreamPage() {
     const vh = video.videoHeight
     const rotated = rotation === 90 || rotation === 270
 
-    // Para 90°/270° o canvas troca largura e altura
     canvas.width  = rotated ? vh : vw
     canvas.height = rotated ? vw : vh
 
@@ -285,24 +303,40 @@ export default function StreamPage() {
     setStatusKind('scanning')
     setStatusMsg('Lendo texto da carta...')
 
+    // Cria AbortController para poder cancelar
+    const abort = new AbortController()
+    abortRef.current = abort
+
     try {
-      // Reduz a imagem para max 1200px — resolução suficiente para ler números pequenos
+      // Recorta canvas para a região ajustável
+      const r = scanRegion
+      const cropX = Math.round(canvas.width  * r.x / 100)
+      const cropY = Math.round(canvas.height * r.y / 100)
+      const cropW = Math.round(canvas.width  * r.w / 100)
+      const cropH = Math.round(canvas.height * r.h / 100)
+      const crop  = document.createElement('canvas')
+      crop.width  = cropW
+      crop.height = cropH
+      crop.getContext('2d')!.drawImage(canvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH)
+
+      // Reduz para max 1200px
       const MAX_W = 1200
       let imageBase64: string
-      if (canvas.width > MAX_W) {
+      if (crop.width > MAX_W) {
         const thumb = document.createElement('canvas')
-        const scale = MAX_W / canvas.width
+        const scale = MAX_W / crop.width
         thumb.width  = MAX_W
-        thumb.height = Math.round(canvas.height * scale)
-        thumb.getContext('2d')!.drawImage(canvas, 0, 0, thumb.width, thumb.height)
+        thumb.height = Math.round(crop.height * scale)
+        thumb.getContext('2d')!.drawImage(crop, 0, 0, thumb.width, thumb.height)
         imageBase64 = thumb.toDataURL('image/jpeg', 0.85)
       } else {
-        imageBase64 = canvas.toDataURL('image/jpeg', 0.85)
+        imageBase64 = crop.toDataURL('image/jpeg', 0.85)
       }
 
       const vRes  = await fetch('/api/vision', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ imageBase64 }),
+        signal: abort.signal,
       })
       const vData = await vRes.json()
 
@@ -329,7 +363,7 @@ export default function StreamPage() {
       if (vData.cardNumber) params.set('number', vData.cardNumber)
       if (setId)            params.set('setId',  setId)
 
-      const cRes  = await fetch(`/api/cards?${params}`)
+      const cRes  = await fetch(`/api/cards?${params}`, { signal: abort.signal })
       const cData = await cRes.json()
 
       if (!cData.cards?.length) {
@@ -382,14 +416,16 @@ export default function StreamPage() {
       coolRef.current = true
       setTimeout(() => { coolRef.current = false }, 3000)
 
-    } catch {
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === 'AbortError') return // cancelado pelo usuário
       setStatusKind('error')
       setStatusMsg('Erro de conexão — verifique a internet')
     } finally {
       analyzingRef.current = false
       setAnalyzing(false)
+      abortRef.current = null
     }
-  }, [setId, rotation])
+  }, [setId, rotation, scanRegion])
 
   // ── Auto scan ──
   const startAuto = useCallback(() => {
@@ -443,6 +479,46 @@ export default function StreamPage() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(chosen),
     })
+  }, [])
+
+  // ── Drag da região de scan ──
+  const onRegionPointerDown = useCallback((e: React.PointerEvent, type: string) => {
+    if (!adjustMode) return
+    e.preventDefault()
+    e.stopPropagation()
+    ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+    dragInfoRef.current = {
+      type, px: e.clientX, py: e.clientY,
+      sx: scanRegion.x, sy: scanRegion.y, sw: scanRegion.w, sh: scanRegion.h,
+    }
+  }, [adjustMode, scanRegion])
+
+  const onContainerPointerMove = useCallback((e: React.PointerEvent) => {
+    const d = dragInfoRef.current
+    if (!d || !cameraBoxRef.current) return
+    const rect = cameraBoxRef.current.getBoundingClientRect()
+    const dx = (e.clientX - d.px) / rect.width  * 100
+    const dy = (e.clientY - d.py) / rect.height * 100
+    const MIN = 15 // mínimo 15% de tamanho
+    setScanRegion(prev => {
+      let { x, y, w, h } = { x: d.sx, y: d.sy, w: d.sw, h: d.sh }
+      if (d.type === 'move') {
+        x = Math.max(0, Math.min(100 - w, d.sx + dx))
+        y = Math.max(0, Math.min(100 - h, d.sy + dy))
+      } else {
+        if (d.type === 'nw') { x = Math.min(d.sx + d.sw - MIN, d.sx + dx); y = Math.min(d.sy + d.sh - MIN, d.sy + dy); w = d.sw - (x - d.sx); h = d.sh - (y - d.sy) }
+        if (d.type === 'ne') { y = Math.min(d.sy + d.sh - MIN, d.sy + dy); w = Math.max(MIN, d.sw + dx); h = d.sh - (y - d.sy) }
+        if (d.type === 'sw') { x = Math.min(d.sx + d.sw - MIN, d.sx + dx); w = d.sw - (x - d.sx); h = Math.max(MIN, d.sh + dy) }
+        if (d.type === 'se') { w = Math.max(MIN, d.sw + dx); h = Math.max(MIN, d.sh + dy) }
+        x = Math.max(0, x); y = Math.max(0, y)
+        w = Math.min(100 - x, w); h = Math.min(100 - y, h)
+      }
+      return { x, y, w, h }
+    })
+  }, [])
+
+  const onContainerPointerUp = useCallback(() => {
+    dragInfoRef.current = null
   }, [])
 
   const filteredSets = sets.filter(s => {
@@ -627,7 +703,13 @@ export default function StreamPage() {
 
         {/* ── Câmera (esquerda) ── */}
         <div className="flex-1 flex flex-col p-4 min-w-0">
-          <div className="relative flex-1 rounded-2xl overflow-hidden min-h-0"
+          <div
+            ref={cameraBoxRef}
+            className="relative flex-1 rounded-2xl overflow-hidden min-h-0"
+            onPointerMove={onContainerPointerMove}
+            onPointerUp={onContainerPointerUp}
+            onPointerLeave={onContainerPointerUp}
+
             style={{
               background: '#000',
               border: cameraActive ? '1px solid rgba(255,255,255,0.08)' : '1px solid rgba(255,255,255,0.04)',
@@ -657,56 +739,95 @@ export default function StreamPage() {
               </div>
             )}
 
-            {/* Scanner overlay */}
+            {/* ── Região de scan ajustável ── */}
             {cameraActive && (
-              <div className="absolute inset-0 pointer-events-none">
-                {/* Cantos do scanner */}
-                <div className="absolute inset-10">
-                  {/* Topo-esquerda */}
-                  <div className="absolute top-0 left-0">
-                    <div className="absolute top-0 left-0 w-8 h-[3px] rounded-full"
-                      style={{ background: 'linear-gradient(90deg,#facc15,transparent)', boxShadow: '0 0 8px rgba(250,204,21,0.6)' }} />
-                    <div className="absolute top-0 left-0 h-8 w-[3px] rounded-full"
-                      style={{ background: 'linear-gradient(180deg,#facc15,transparent)', boxShadow: '0 0 8px rgba(250,204,21,0.6)' }} />
-                    <div className="absolute top-0 left-0 w-2 h-2 rounded-full bg-yellow-400"
-                      style={{ boxShadow: '0 0 10px rgba(250,204,21,0.9), 0 0 20px rgba(250,204,21,0.4)' }} />
-                  </div>
-                  {/* Topo-direita */}
-                  <div className="absolute top-0 right-0">
-                    <div className="absolute top-0 right-0 w-8 h-[3px] rounded-full"
-                      style={{ background: 'linear-gradient(270deg,#facc15,transparent)', boxShadow: '0 0 8px rgba(250,204,21,0.6)' }} />
-                    <div className="absolute top-0 right-0 h-8 w-[3px] rounded-full"
-                      style={{ background: 'linear-gradient(180deg,#facc15,transparent)', boxShadow: '0 0 8px rgba(250,204,21,0.6)' }} />
-                    <div className="absolute top-0 right-0 w-2 h-2 rounded-full bg-yellow-400"
-                      style={{ boxShadow: '0 0 10px rgba(250,204,21,0.9), 0 0 20px rgba(250,204,21,0.4)' }} />
-                  </div>
-                  {/* Baixo-esquerda */}
-                  <div className="absolute bottom-0 left-0">
-                    <div className="absolute bottom-0 left-0 w-8 h-[3px] rounded-full"
-                      style={{ background: 'linear-gradient(90deg,#facc15,transparent)', boxShadow: '0 0 8px rgba(250,204,21,0.6)' }} />
-                    <div className="absolute bottom-0 left-0 h-8 w-[3px] rounded-full"
-                      style={{ background: 'linear-gradient(0deg,#facc15,transparent)', boxShadow: '0 0 8px rgba(250,204,21,0.6)' }} />
-                    <div className="absolute bottom-0 left-0 w-2 h-2 rounded-full bg-yellow-400"
-                      style={{ boxShadow: '0 0 10px rgba(250,204,21,0.9), 0 0 20px rgba(250,204,21,0.4)' }} />
-                  </div>
-                  {/* Baixo-direita */}
-                  <div className="absolute bottom-0 right-0">
-                    <div className="absolute bottom-0 right-0 w-8 h-[3px] rounded-full"
-                      style={{ background: 'linear-gradient(270deg,#facc15,transparent)', boxShadow: '0 0 8px rgba(250,204,21,0.6)' }} />
-                    <div className="absolute bottom-0 right-0 h-8 w-[3px] rounded-full"
-                      style={{ background: 'linear-gradient(0deg,#facc15,transparent)', boxShadow: '0 0 8px rgba(250,204,21,0.6)' }} />
-                    <div className="absolute bottom-0 right-0 w-2 h-2 rounded-full bg-yellow-400"
-                      style={{ boxShadow: '0 0 10px rgba(250,204,21,0.9), 0 0 20px rgba(250,204,21,0.4)' }} />
-                  </div>
+              <div className="absolute inset-0" style={{ pointerEvents: adjustMode ? 'auto' : 'none' }}>
+
+                {/* Escurecimento fora da região */}
+                {adjustMode && (
+                  <>
+                    <div className="absolute inset-0 bg-black/45" />
+                    <div className="absolute bg-transparent" style={{
+                      left: `${scanRegion.x}%`, top: `${scanRegion.y}%`,
+                      width: `${scanRegion.w}%`, height: `${scanRegion.h}%`,
+                      boxShadow: '0 0 0 9999px rgba(0,0,0,0.45)',
+                    }} />
+                  </>
+                )}
+
+                {/* Caixa da região */}
+                <div
+                  className="absolute"
+                  style={{
+                    left: `${scanRegion.x}%`, top: `${scanRegion.y}%`,
+                    width: `${scanRegion.w}%`, height: `${scanRegion.h}%`,
+                    border: adjustMode ? '1.5px dashed rgba(250,204,21,0.7)' : 'none',
+                    cursor: adjustMode ? 'move' : 'default',
+                  }}
+                  onPointerDown={e => onRegionPointerDown(e, 'move')}
+                >
+                  {/* Cantos decorativos (sempre visíveis) */}
+                  {[
+                    { corner: 'nw', style: { top: -1, left: -1 } },
+                    { corner: 'ne', style: { top: -1, right: -1 } },
+                    { corner: 'sw', style: { bottom: -1, left: -1 } },
+                    { corner: 'se', style: { bottom: -1, right: -1 } },
+                  ].map(({ corner, style }) => (
+                    <div key={corner} className="absolute" style={style}>
+                      {/* Linha horizontal */}
+                      <div className="absolute" style={{
+                        width: 28, height: 3, borderRadius: 2,
+                        background: 'linear-gradient(90deg,#facc15,rgba(250,204,21,0.1))',
+                        boxShadow: '0 0 8px rgba(250,204,21,0.6)',
+                        top: 0,
+                        ...(corner.includes('e') ? { right: 0, transform: 'scaleX(-1)' } : { left: 0 }),
+                      }} />
+                      {/* Linha vertical */}
+                      <div className="absolute" style={{
+                        width: 3, height: 28, borderRadius: 2,
+                        background: 'linear-gradient(180deg,#facc15,rgba(250,204,21,0.1))',
+                        boxShadow: '0 0 8px rgba(250,204,21,0.6)',
+                        left: corner.includes('e') ? 'auto' : 0,
+                        right: corner.includes('e') ? 0 : 'auto',
+                        ...(corner.includes('s') ? { bottom: 0, transform: 'scaleY(-1)' } : { top: 0 }),
+                      }} />
+                      {/* Ponto glow */}
+                      <div className="absolute w-2 h-2 rounded-full bg-yellow-400" style={{
+                        top: corner.includes('s') ? 'auto' : -3,
+                        bottom: corner.includes('s') ? -3 : 'auto',
+                        left: corner.includes('e') ? 'auto' : -3,
+                        right: corner.includes('e') ? -3 : 'auto',
+                        boxShadow: '0 0 10px rgba(250,204,21,0.9)',
+                        pointerEvents: adjustMode ? 'auto' : 'none',
+                        cursor: adjustMode ? `${corner}-resize` : 'default',
+                        zIndex: 10,
+                      }}
+                        onPointerDown={e => onRegionPointerDown(e, corner)}
+                      />
+                    </div>
+                  ))}
+
+                  {/* Label da área no modo ajuste */}
+                  {adjustMode && (
+                    <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none">
+                      <span className="text-[10px] text-yellow-400/60 font-medium tracking-widest uppercase select-none">
+                        Arraste os cantos para ajustar
+                      </span>
+                    </div>
+                  )}
                 </div>
 
-                {/* Linha de scan */}
-                {(autoMode || analyzing) && (
+                {/* Linha de scan (só fora do modo ajuste) */}
+                {!adjustMode && (autoMode || analyzing) && (
                   <motion.div
-                    animate={{ top: ['12%', '86%', '12%'] }}
+                    animate={{ top: [`${scanRegion.y + 2}%`, `${scanRegion.y + scanRegion.h - 2}%`, `${scanRegion.y + 2}%`] }}
                     transition={{ repeat: Infinity, duration: 2.6, ease: 'linear' }}
-                    className="absolute left-10 right-10 h-[1.5px]"
-                    style={{ background: 'linear-gradient(90deg,transparent 0%,rgba(250,204,21,0.5) 20%,rgba(250,204,21,1) 50%,rgba(250,204,21,0.5) 80%,transparent 100%)', boxShadow: '0 0 12px rgba(250,204,21,0.8), 0 0 30px rgba(250,204,21,0.3)' }}
+                    className="absolute h-[1.5px]"
+                    style={{
+                      left: `${scanRegion.x}%`, width: `${scanRegion.w}%`,
+                      background: 'linear-gradient(90deg,transparent,rgba(250,204,21,0.5),rgba(250,204,21,1),rgba(250,204,21,0.5),transparent)',
+                      boxShadow: '0 0 12px rgba(250,204,21,0.8)',
+                    }}
                   />
                 )}
               </div>
@@ -1034,12 +1155,42 @@ export default function StreamPage() {
                 {autoMode ? <><Square size={13} /> Parar</> : <><Play size={13} /> Auto-Scan</>}
               </motion.button>
 
-              <motion.button whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.96 }}
-                onClick={() => captureAndAnalyze(true)}
-                disabled={analyzing || autoMode}
-                className="flex items-center gap-2 px-4 py-2 rounded-xl border text-[12px] font-semibold hover:bg-white/8 disabled:opacity-30 transition-all"
-                style={{ border: '1px solid rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', background: 'rgba(255,255,255,0.04)' }}>
-                <Zap size={13} /> Manual
+              {/* Cancelar scan travado */}
+              {analyzing ? (
+                <motion.button
+                  initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }}
+                  whileTap={{ scale: 0.95 }}
+                  onClick={cancelAnalyze}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl text-[12px] font-bold border border-red-500/40 bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-all">
+                  <Square size={12} /> Cancelar
+                </motion.button>
+              ) : (
+                <motion.button whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.96 }}
+                  onClick={() => captureAndAnalyze(true)}
+                  disabled={autoMode}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl border text-[12px] font-semibold hover:bg-white/8 disabled:opacity-30 transition-all"
+                  style={{ border: '1px solid rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.7)', background: 'rgba(255,255,255,0.04)' }}>
+                  <Zap size={13} /> Manual
+                </motion.button>
+              )}
+
+              {/* Ajustar área de scan */}
+              <motion.button whileTap={{ scale: 0.9 }}
+                onClick={() => setAdjustMode(v => !v)}
+                title="Ajustar área de scan"
+                className={`flex items-center gap-1.5 px-3 py-2 rounded-xl border text-[11px] font-medium transition-all ${
+                  adjustMode
+                    ? 'border-yellow-400/50 bg-yellow-400/10 text-yellow-400'
+                    : 'border-white/8 bg-white/3 text-white/35 hover:border-yellow-400/25 hover:text-yellow-400/60'
+                }`}>
+                <svg width="13" height="13" viewBox="0 0 13 13" fill="none" stroke="currentColor" strokeWidth="1.5">
+                  <rect x="2" y="2" width="9" height="9" rx="1" strokeDasharray="2 1.5"/>
+                  <circle cx="2" cy="2" r="1.5" fill="currentColor" stroke="none"/>
+                  <circle cx="11" cy="2" r="1.5" fill="currentColor" stroke="none"/>
+                  <circle cx="2" cy="11" r="1.5" fill="currentColor" stroke="none"/>
+                  <circle cx="11" cy="11" r="1.5" fill="currentColor" stroke="none"/>
+                </svg>
+                {adjustMode ? 'Confirmar' : 'Área'}
               </motion.button>
 
               <motion.button whileTap={{ scale: 0.88 }}
